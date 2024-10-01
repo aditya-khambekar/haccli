@@ -81,7 +81,7 @@ print()
 soup = BeautifulSoup(r.text, "lxml")
 
 classes = soup.find_all("div", class_="AssignmentClass")
-1
+
 for i, result in enumerate(classes):
     title_tag = result.find("a")
     class_name = " ".join(title_tag.text.strip().split(" ")[3:]).strip()
