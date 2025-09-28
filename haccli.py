@@ -1,5 +1,3 @@
-#!/bin/env python3
-
 import requests
 import re
 from bs4 import BeautifulSoup
@@ -8,13 +6,18 @@ import json
 import keyring
 from platformdirs import user_config_dir
 import os
+from halo import Halo
 
 hac_url = "homeaccess.katyisd.org"
+SERVICE_NAME = "haccli"
 
 config_dir = user_config_dir("haccli")
-config_file = config_dir + "/storedlogin.json"
+config_file = config_dir + "/config.json"
+
+print(config_dir)
 
 s = requests.Session()
+
 try:
     with open(config_file, "r") as f:
         contents = f.read()
@@ -24,30 +27,57 @@ except FileNotFoundError:
 if len(contents.strip()) == 0:
     contents = "{}"
 
-data = json.loads(contents)
+config = json.loads(contents)
 
-if "username" in data and "password" in data:
-    username = data["username"]
-    password = data["password"]
-    print("Logging in with saved password...")
+saved_username = config.get("username")
+password = None
+
+if saved_username:
+    try:
+        password = keyring.get_password(SERVICE_NAME, saved_username)
+        if password:
+            print(f"Found saved credentials for: {saved_username}")
+            username = saved_username
+        else:
+            print(f"Username found ({saved_username}) but no password in keyring")
+            username = saved_username
+            password = getpass("Password: ")
+    except Exception as e:
+        print(f"Error accessing keyring: {e}")
+        username = input("ID: ")
+        password = getpass("Password: ")
 else:
     username = input("ID: ")
-    password = getpass()
+    password = input("Password: ")
 
-if "store_password" not in data:
-    response = input("Store password in plain text file? [y/N] ")
-    if (response.lower().startswith("y")):
-        data["store_password"] = True
-        data["username"] = username
-        data["password"] = password
 
-        if not os.path.exists(config_dir):
-            os.makedirs(config_dir)
+if "save_credentials" not in config:
+    save_choice = input("Save credentials securely in system keyring? [y/N] ").lower().strip()
 
-        with open(config_file, "w+") as f:
-            f.write(json.dumps(data))
+    if save_choice.startswith("y"):
+        config["save_credentials"] = True
+        config["username"] = username
 
-r = s.get(f'https://{hac_url}/HomeAccess/Account/LogOn')
+        # Save password to system keyring
+        try:
+            keyring.set_password(SERVICE_NAME, username, password)
+            print("✓ Credentials saved securely to system keyring")
+        except Exception as e:
+            print(f"✗ Failed to save to keyring: {e}")
+            config["save_credentials"] = False
+    else:
+        config["save_credentials"] = False
+
+    # Save non-sensitive config
+    if not os.path.exists(config_dir):
+        os.makedirs(config_dir)
+
+    with open(config_file, "w") as f:
+        f.write(json.dumps(config, indent=2))
+
+with Halo(text='Connecting to HomeAccess...', spinner='dots') as spinner:
+    r = s.get(f'https://{hac_url}/HomeAccess/Account/LogOn')
+    spinner.succeed('Connected to HomeAccess')
 
 request_verification_token = re.search(
     '(?<=<input name="__RequestVerificationToken" type="hidden" value=")(.*?)(?=")', r.text).group(1)
@@ -59,26 +89,53 @@ loginData = {
     "LogOnDetails.Password": password
 }
 
-r = s.post(f'https://{hac_url}/HomeAccess/Account/LogOn', data=loginData)
-soup = BeautifulSoup(r.text, "lxml")
-validation_error_div = soup.find("div", class_="validation-summary-errors")
+with Halo(text='Logging in...', spinner='dots') as spinner:
+    r = s.post(f'https://{hac_url}/HomeAccess/Account/LogOn', data=loginData)
+    soup = BeautifulSoup(r.text, "lxml")
+    validation_error_div = soup.find("div", class_="validation-summary-errors")
+    request_error_div = soup.find("div", class_="caption")
 
-request_error_div = soup.find("div", class_="caption")
+    if validation_error_div is not None:
+        spinner.fail("Login failed!")
+        error_msg = validation_error_div.find("li").text.strip()
+        print(error_msg)
 
-if (validation_error_div is not None):
-    print(validation_error_div.find("li").text.strip())
-elif (request_error_div is not None):
-    print(request_error_div.text.strip())
-else:
-    print("Login success!")
+        if saved_username and "Invalid" in error_msg:
+            delete_choice = input("Delete saved credentials? [y/N] ").lower().strip()
+            if delete_choice.startswith("y"):
+                try:
+                    keyring.delete_password(SERVICE_NAME, saved_username)
+                    config.pop("username", None)
+                    config["save_credentials"] = False
+                    with open(config_file, "w") as f:
+                        f.write(json.dumps(config, indent=2))
+                    print("✓ Saved credentials removed")
+                except Exception as e:
+                    print(f"✗ Error removing credentials: {e}")
+        exit(1)
+    elif request_error_div is not None:
+        spinner.fail("Login failed!")
+        print(request_error_div.text.strip())
+        exit(1)
+    else:
+        spinner.succeed("Login successful!")
 
-print("Getting grades...")
-
-r = s.get(f'https://{hac_url}/HomeAccess/Content/Student/Assignments.aspx')
+with Halo(text='Fetching grades...', spinner='dots') as spinner:
+    r = s.get(f'https://{hac_url}/HomeAccess/Content/Student/Assignments.aspx')
+    spinner.succeed("Grades loaded!")
 
 print()
 
 soup = BeautifulSoup(r.text, "lxml")
+
+def clean_assignment_name(name:str) -> str:
+    x = name
+    x = x.replace("&quot;", "\"")
+    x = x.replace("&amp;", "&")
+    x = x.replace("&#39;", "'")
+    if len(x) >= 41:
+        x = x[:38] + "..."
+    return x
 
 classes = soup.find_all("div", class_="AssignmentClass")
 
@@ -103,7 +160,7 @@ for i, result in enumerate(classes):
         cells = assignment.find_all("td")
         due_date = cells[0].text.strip()
         date_assigned = cells[1].text.strip()
-        assignment_name = cells[2].text.strip().splitlines()[0]
+        assignment_name = clean_assignment_name(cells[2].text.strip().splitlines()[0])
         category = cells[3].text.strip()
         score = cells[4].text.strip()
         total_points = cells[5].text.strip()
